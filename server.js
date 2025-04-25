@@ -1,7 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const NodeCache = require('node-cache');
-const cache = new NodeCache({ stdTTL: 3600 }); // 1h TTL
+const cache = new NodeCache({ stdTTL: 3600 });
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -13,17 +13,18 @@ app.get('/', (req, res) => {
 
 app.get('/api/fetchCardPrice', async (req, res) => {
   try {
-    const { cardName, setName, cardNumber } = req.query;
-    if (!cardName) return res.status(400).json({ error: 'cardName query parameter is required' });
+    const { cardName, setName, cardNumber, condition, sellerLocation } = req.query;
+    if (!cardName) return res.status(400).json({ error: 'cardName is required' });
 
-    const searchQuery = [cardName, setName, cardNumber, 'sold']
-      .filter(Boolean)
-      .join(' ');
+    const parts = [cardName, setName, cardNumber, 'sold'];
+    if (condition) parts.push(`condition:${condition}`);
+    if (sellerLocation) parts.push(`location:${sellerLocation}`);
+    const searchQuery = parts.filter(Boolean).join(' ');
     const cacheKey = searchQuery.toLowerCase();
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
-    const tokenResponse = await axios.post(
+    const tokenRes = await axios.post(
       'https://api.ebay.com/identity/v1/oauth2/token',
       'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
       {
@@ -34,24 +35,30 @@ app.get('/api/fetchCardPrice', async (req, res) => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       }
     );
-    const accessToken = tokenResponse.data.access_token;
+    const token = tokenRes.data.access_token;
+
     const params = new URLSearchParams({ q: searchQuery, limit: '5' });
-    const itemsResponse = await axios.get(
+    const itemsRes = await axios.get(
       `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
-      { headers: { Authorization: `Bearer ${accessToken}` } }
+      { headers: { Authorization: `Bearer ${token}` } }
     );
-    const items = itemsResponse.data.itemSummaries || [];
+    const items = itemsRes.data.itemSummaries || [];
     const prices = items.map(i => parseFloat(i.price.value));
     const avgPrice = prices.length ? prices.reduce((a,b)=>a+b,0)/prices.length : 0;
     const payload = { avgPrice, items };
 
     cache.set(cacheKey, payload);
     res.json(payload);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch from eBay', details: err.toString() });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Fetch failed', details: e.toString() });
   }
 });
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
+
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);

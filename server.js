@@ -1,103 +1,95 @@
 const express = require('express');
 const axios = require('axios');
 const NodeCache = require('node-cache');
-const { parseStringPromise } = require('xml2js');
 
 const cache = new NodeCache({ stdTTL: 3600 });
 const app = express();
 const port = process.env.PORT || 3000;
-const FINDING_BASE = 'https://svcs.ebay.com/services/search/FindingService/v1';
 
-async function getBrowseToken() {
+// noise terms to exclude
+const NOISE_REGEX = /\b(lot|binder|bulk|psa|proxy)\b/i;
+// acceptable price range
+const MIN_PRICE = 2;
+const MAX_PRICE = 500;
+
+async function getToken() {
   const r = await axios.post(
     'https://api.ebay.com/identity/v1/oauth2/token',
     'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
     {
-      auth: { username: process.env.EBAY_CLIENT_ID, password: process.env.EBAY_CLIENT_SECRET },
+      auth: {
+        username: process.env.EBAY_CLIENT_ID,
+        password: process.env.EBAY_CLIENT_SECRET
+      },
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     }
   );
   return r.data.access_token;
 }
 
-function summarize(prices) {
-  const n = prices.length;
-  if (n === 0) return { count: 0, avgPrice: 0, median: 0, min: 0, max: 0, stdDev: 0 };
-  prices.sort((a,b)=>a-b);
-  const sum = prices.reduce((a,b)=>a+b, 0);
-  const avg = sum / n;
-  const mid = Math.floor(n/2);
-  const median = n % 2 === 1
-    ? prices[mid]
-    : (prices[mid-1] + prices[mid]) / 2;
-  const min = prices[0];
-  const max = prices[n-1];
-  const variance = prices.reduce((v, p) => v + Math.pow(p - avg, 2), 0) / n;
-  const stdDev = Math.sqrt(variance);
-  return { count: n, avgPrice: avg, median, min, max, stdDev };
-}
-
-async function browseSearch(query) {
-  const token = await getBrowseToken();
-  const params = new URLSearchParams({ q: query, limit: '5' });
+async function browseSearch(query, cardName, setName, cardNumber, condition) {
+  const token = await getToken();
+  const params = new URLSearchParams({ q: query, limit: '10' });
   const r = await axios.get(
     `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
-  const prices = (r.data.itemSummaries || []).map(i => parseFloat(i.price.value));
-  return summarize(prices);
+  // strict filtering by title and noise/outliers
+  const filtered = (r.data.itemSummaries || []).filter(item => {
+    const title = item.title.toLowerCase();
+    // must include exact card number, name, and set
+    if (!title.includes(cardNumber.toLowerCase())) return false;
+    if (!title.includes(cardName.toLowerCase())) return false;
+    if (!title.includes(setName.toLowerCase())) return false;
+    // exclude noise terms
+    if (NOISE_REGEX.test(title)) return false;
+    // condition filter if requested
+    if (condition.toLowerCase() === 'new' && !/near mint|mint/i.test(title)) return false;
+    if (condition.toLowerCase() === 'used' && /sealed|new/i.test(title)) return false;
+    return true;
+  });
+
+  const prices = filtered
+    .map(i => parseFloat(i.price.value))
+    .filter(p => p >= MIN_PRICE && p <= MAX_PRICE);
+
+  const count = prices.length;
+  const avgPrice = count
+    ? prices.reduce((sum, p) => sum + p, 0) / count
+    : 0;
+
+  return { avgPrice, count };
 }
 
-async function findingSearch(keywords, daysAgo) {
-  const now = new Date();
-  const from = new Date(now - daysAgo*24*3600*1000).toISOString();
-  const to   = now.toISOString();
-  const xml = await axios.get(FINDING_BASE, {
-    params: {
-      'OPERATION-NAME':'findCompletedItems',
-      'SERVICE-VERSION':'1.13.0',
-      'SECURITY-APPNAME':process.env.EBAY_CLIENT_ID,
-      'RESPONSE-DATA-FORMAT':'XML',
-      'REST-PAYLOAD':true,
-      keywords,
-      'itemFilter(0).name':'SoldItemsOnly',
-      'itemFilter(0).value':'true',
-      'itemFilter(1).name':'EndTimeFrom',
-      'itemFilter(1).value':from,
-      'itemFilter(2).name':'EndTimeTo',
-      'itemFilter(2).value':to,
-      'paginationInput.entriesPerPage':'100'
-    }
-  }).then(r=>r.data);
-  const js = await parseStringPromise(xml);
-  const prices = (js.findCompletedItemsResponse.searchResult[0].item || [])
-    .map(i => parseFloat(i.sellingStatus[0].currentPrice[0]._));
-  return summarize(prices);
-}
-
-async function fetchOne(opts) {
-  const { cardName, setName, cardNumber, condition, sellerLocation, globalFallback, daysAgo } = opts;
+async function fetchOne({ cardName, setName, cardNumber, condition = '', sellerLocation = '', globalFallback = false }) {
   const base = [cardName, setName, cardNumber].filter(Boolean).join(' ');
-  // 1) daysAgo via Finding API
-  if (daysAgo > 0) {
-    try { return await findingSearch(base, daysAgo); }
-    catch(err) { console.warn('Finding error, fallback…'); }
+  // Primary query: exact match + sold + location
+  const primaryQueryParts = [base, 'sold'];
+  if (sellerLocation) primaryQueryParts.push(`location:${sellerLocation}`);
+  if (condition)      primaryQueryParts.push(`condition:${condition}`);
+  const primaryQuery = primaryQueryParts.join(' ');
+  const cacheKey = primaryQuery.toLowerCase();
+
+  if (cache.has(cacheKey)) {
+    return cache.get(cacheKey);
   }
-  // 2) Browse logic
-  const primary = [base, 'sold', `location:${sellerLocation}`]
-    .concat(condition? [`condition:${condition}`]:[])
-    .join(' ');
-  const key = primary.toLowerCase();
-  if (cache.has(key)) return cache.get(key);
-  let result = await browseSearch(primary);
-  if (result.count===0 && condition) {
-    const f2 = [base, 'sold', `location:${sellerLocation}`].join(' ');
-    result = await browseSearch(f2);
+
+  // 1) try strict browse search
+  let result = await browseSearch(primaryQuery, cardName, setName, cardNumber, condition);
+
+  // 2) fallback: drop only condition filter
+  if (result.count === 0 && condition) {
+    const fallbackQuery = [base, 'sold', `location:${sellerLocation}`].join(' ');
+    result = await browseSearch(fallbackQuery, cardName, setName, cardNumber, '');
   }
-  if (result.count===0 && globalFallback) {
-    result = await browseSearch([base,'sold'].join(' '));
+
+  // 3) optional global fallback: drop location
+  if (result.count === 0 && globalFallback) {
+    const globalQuery = [base, 'sold'].join(' ');
+    result = await browseSearch(globalQuery, cardName, setName, cardNumber, '');
   }
-  cache.set(key, result);
+
+  cache.set(cacheKey, result);
   return result;
 }
 
@@ -105,13 +97,17 @@ app.use(express.json());
 app.post('/api/fetchBulkPrices', async (req, res) => {
   try {
     const inputs = req.body;
-    if (!Array.isArray(inputs)) return res.status(400).json({ error:'Expected an array' });
-    const out = await Promise.all(inputs.map(fetchOne));
-    res.json(out);
+    if (!Array.isArray(inputs)) {
+      return res.status(400).json({ error: 'Expected an array of inputs' });
+    }
+    const results = await Promise.all(inputs.map(fetchOne));
+    res.json(results);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error:'Bulk fetch failed', details:e.toString() });
+    res.status(500).json({ error: 'Bulk fetch failed', details: e.toString() });
   }
 });
 
-app.listen(port,()=>console.log(`Server on port ${port}`));
+app.listen(port, () => {
+  console.log(`CardCatch backend running on port ${port}`);
+});

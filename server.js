@@ -49,7 +49,6 @@ app.post('/api/fetchCardPrices', async (req, res) => {
 
       if (!title || !priceText) return;
 
-      // Clean price
       priceText = priceText.replace(/[^\d\.]/g, '');
       const price = parseFloat(priceText);
 
@@ -79,7 +78,7 @@ app.post('/api/fetchCardPrices', async (req, res) => {
     const priceMin = Math.min(...items);
     const priceMax = Math.max(...items);
 
-    res.json({
+    return res.json({
       avgPrice: parseFloat(avgPrice.toFixed(2)),
       soldCount: items.length,
       priceMin: parseFloat(priceMin.toFixed(2)),
@@ -88,17 +87,7 @@ app.post('/api/fetchCardPrices', async (req, res) => {
 
   } catch (error) {
     console.error(error.message);
-    res.status(500).json({ error: 'Failed to fetch prices' });
-  }
-});
-
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
-
-  } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ error: 'Failed to fetch prices' });
+    return res.status(500).json({ error: 'Failed to fetch prices' });
   }
 });
 

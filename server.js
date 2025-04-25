@@ -1,103 +1,90 @@
 const express = require('express');
+const cors = require('cors');
 const axios = require('axios');
-const NodeCache = require('node-cache');
 
-const cache = new NodeCache({ stdTTL: 3600 });
 const app = express();
 const port = process.env.PORT || 3000;
 
-// noise terms to exclude from titles
-const NOISE_REGEX = /\b(lot|binder|bulk|proxy)\b/i;
-// outlier price bounds
-const MIN_PRICE = 2;
-const MAX_PRICE = 500;
-
-async function getToken() {
-  const r = await axios.post(
-    'https://api.ebay.com/identity/v1/oauth2/token',
-    'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
-    {
-      auth: {
-        username: process.env.EBAY_CLIENT_ID,
-        password: process.env.EBAY_CLIENT_SECRET
-      },
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    }
-  );
-  return r.data.access_token;
-}
-
-async function browseSearch({ cardName, setName, condition, rarity, graded, language }) {
-  const token = await getToken();
-  const parts = ['sold', cardName, setName];
-  if (condition) parts.push(condition);
-  if (rarity)    parts.push(rarity);
-  if (language)  parts.push(language);
-  // we'll filter for graded IDs in code, not in query
-  const query = parts.join(' ');
-  const params = new URLSearchParams({ q: query, limit: '10' });
-  const resp = await axios.get(
-    `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  const items = resp.data.itemSummaries || [];
-
-  // 1) text‐filter
-  let filtered = items.filter(i => {
-    const t = i.title.toLowerCase();
-    if (NOISE_REGEX.test(t))            return false;
-    if (condition && !t.includes(condition.toLowerCase())) return false;
-    if (rarity    && !t.includes(rarity.toLowerCase()))    return false;
-    if (language  && !t.includes(language.toLowerCase()))  return false;
-    if (graded) {
-      // only PSA/CGC listings
-      if (!/(psa|cgc)/i.test(t)) return false;
-    } else {
-      // exclude any PSA/CGC
-      if (/(psa|cgc)/i.test(t))  return false;
-    }
-    return true;
-  });
-
-  // 2) numeric filter
-  const prices = filtered
-    .map(i => parseFloat(i.price.value))
-    .filter(p => p >= MIN_PRICE && p <= MAX_PRICE);
-
-  const count = prices.length;
-  const avgPrice = count
-    ? prices.reduce((sum, v) => sum + v, 0) / count
-    : 0;
-
-  return { avgPrice, count };
-}
-
-async function fetchOne(opts) {
-  const key = JSON.stringify(opts).toLowerCase();
-  if (cache.has(key)) return cache.get(key);
-
-  const result = await browseSearch(opts);
-  cache.set(key, result);
-  return result;
-}
-
+app.use(cors());
 app.use(express.json());
-app.post('/api/fetchBulkPrices', async (req, res) => {
+
+app.get('/', (req, res) => {
+  res.send('CardCatch v2 backend is running.');
+});
+
+app.post('/api/fetchCardPrices', async (req, res) => {
   try {
-    const rows = req.body;
-    if (!Array.isArray(rows)) {
-      return res.status(400).json({ error: 'Expected an array of inputs' });
+    const {
+      cardName,
+      setName,
+      rarityKeyword,
+      mustInclude,
+      mustNotInclude,
+      graded,
+      gradingCompany,
+      grade
+    } = req.body;
+
+    const keywords = [cardName, setName, rarityKeyword].filter(Boolean).join(' ');
+    const includeKeywords = mustInclude ? mustInclude.split(',').map(w => w.trim()) : [];
+    const excludeKeywords = mustNotInclude ? mustNotInclude.split(',').map(w => w.trim()) : [];
+
+    const ebayResponse = await axios.post('https://api.scraperapi.com/', {
+      apiKey: 'YOUR_SCRAPERAPI_KEY',  // Insert your ScraperAPI key if needed
+      url: `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(keywords)}&_sop=13&LH_Sold=1&LH_Complete=1&LH_BIN=1&LH_ItemCondition=3000&LH_LocatedIn=GB&rt=nc&LH_PrefLoc=1&_ipg=200`
+    });
+
+    const html = ebayResponse.data;
+    const itemRegex = /"itemTitle":"(.*?)".*?"price":"([\d\.]+)"/g;
+    let match;
+    const items = [];
+
+    while ((match = itemRegex.exec(html)) !== null) {
+      const title = match[1];
+      const price = parseFloat(match[2]);
+
+      if (includeKeywords.length && !includeKeywords.some(word => title.toLowerCase().includes(word.toLowerCase()))) {
+        continue;
+      }
+      if (excludeKeywords.length && excludeKeywords.some(word => title.toLowerCase().includes(word.toLowerCase()))) {
+        continue;
+      }
+      if (graded && gradingCompany) {
+        if (!title.toLowerCase().includes(gradingCompany.toLowerCase())) continue;
+      }
+      if (graded && grade) {
+        if (!title.includes(grade)) continue;
+      }
+
+      items.push(price);
     }
-    const out = await Promise.all(
-      rows.map(r => fetchOne(r))
-    );
-    res.json(out);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Bulk fetch failed', details: e.toString() });
+
+    if (items.length === 0) {
+      return res.json({
+        avgPrice: 0,
+        soldCount: 0,
+        priceMin: 0,
+        priceMax: 0
+      });
+    }
+
+    const avgPrice = items.reduce((a, b) => a + b, 0) / items.length;
+    const priceMin = Math.min(...items);
+    const priceMax = Math.max(...items);
+
+    res.json({
+      avgPrice: parseFloat(avgPrice.toFixed(2)),
+      soldCount: items.length,
+      priceMin: priceMin,
+      priceMax: priceMax
+    });
+
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: 'Failed to fetch prices' });
   }
 });
 
 app.listen(port, () => {
-  console.log(`CardCatch backend running on port ${port}`);
+  console.log(`Server is running on port ${port}`);
 });

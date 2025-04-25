@@ -39,10 +39,13 @@ async function browseSearch(cardName, setName, cardNumber, condition, sellerLoca
   );
   const items = r.data.itemSummaries || [];
 
+  // ensure cardNumber is a string
+  const cn = String(cardNumber).toLowerCase();
+
   // 1) strict filter: must contain cardNumber
   let filtered = items.filter(i => {
     const t = i.title.toLowerCase();
-    return t.includes(cardNumber.toLowerCase());
+    return t.includes(cn);
   });
 
   // 2) if none, fallback: drop cardNumber requirement
@@ -73,7 +76,7 @@ async function fetchOne(opts) {
   const cacheKey = [cardName, setName, cardNumber, condition, sellerLocation].join('|').toLowerCase();
   if (cache.has(cacheKey)) return cache.get(cacheKey);
 
-  // 1) browse search with fallback built in
+  // 1) browse search with built-in strict→loose fallback
   let result = await browseSearch(cardName, setName, cardNumber, condition, sellerLocation);
 
   // 2) optional global fallback if still zero

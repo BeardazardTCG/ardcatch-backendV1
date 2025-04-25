@@ -38,18 +38,18 @@ async function browseSearch(cardName, setName, cardNumber, condition, sellerLoca
     { headers: { Authorization: `Bearer ${token}` } }
   );
   const items = r.data.itemSummaries || [];
-  
+
   // 1) strict filter: must contain cardNumber
   let filtered = items.filter(i => {
     const t = i.title.toLowerCase();
     return t.includes(cardNumber.toLowerCase());
   });
-  
+
   // 2) if none, fallback: drop cardNumber requirement
   if (filtered.length === 0) {
     filtered = items;
   }
-  
+
   // final filtering: noise, exact name & set, condition, price range
   const clean = filtered.filter(i => {
     const t = i.title.toLowerCase();
@@ -61,10 +61,10 @@ async function browseSearch(cardName, setName, cardNumber, condition, sellerLoca
     const p = parseFloat(i.price.value);
     return p >= MIN_PRICE && p <= MAX_PRICE;
   });
-  
+
   const prices = clean.map(i => parseFloat(i.price.value));
   const count = prices.length;
-  const avgPrice = count ? prices.reduce((s,p) => s + p, 0) / count : 0;
+  const avgPrice = count ? prices.reduce((s, p) => s + p, 0) / count : 0;
   return { avgPrice, count };
 }
 
@@ -86,24 +86,19 @@ async function fetchOne(opts) {
 }
 
 app.use(express.json());
+
 app.post('/api/fetchBulkPrices', async (req, res) => {
   try {
     const inputs = req.body;
     if (!Array.isArray(inputs)) {
       return res.status(400).json({ error: 'Expected an array of inputs' });
     }
-    const out = await Promise.all(inputs.map(fetchOne));
-    res.json(out);
+    const results = await Promise.all(inputs.map(fetchOne));
+    res.json(results);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Bulk fetch failed', details: e.toString() });
   }
-});
-
-app.listen(port, () => {
-  console.log(`CardCatch backend running on port ${port}`);
-});
-
 });
 
 app.listen(port, () => {

@@ -27,66 +27,58 @@ async function getToken() {
   return r.data.access_token;
 }
 
-async function browseSearch(query, cardName, setName, cardNumber, condition) {
+async function browseSearch(cardName, setName, cardNumber, condition, sellerLocation) {
   const token = await getToken();
+  const queryParts = ['sold', `location:${sellerLocation}`, cardName, setName];
+  if (condition) queryParts.push(`condition:${condition}`);
+  const query = queryParts.join(' ');
   const params = new URLSearchParams({ q: query, limit: '10' });
   const r = await axios.get(
     `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
-  // strict filtering by title and noise/outliers
-  const filtered = (r.data.itemSummaries || []).filter(item => {
-    const title = item.title.toLowerCase();
-    // must include exact card number, name, and set
-    if (!title.includes(cardNumber.toLowerCase())) return false;
-    if (!title.includes(cardName.toLowerCase())) return false;
-    if (!title.includes(setName.toLowerCase())) return false;
-    // exclude noise terms
-    if (NOISE_REGEX.test(title)) return false;
-    // condition filter if requested
-    if (condition.toLowerCase() === 'new' && !/near mint|mint/i.test(title)) return false;
-    if (condition.toLowerCase() === 'used' && /sealed|new/i.test(title)) return false;
-    return true;
+  const items = r.data.itemSummaries || [];
+  
+  // 1) strict filter: must contain cardNumber
+  let filtered = items.filter(i => {
+    const t = i.title.toLowerCase();
+    return t.includes(cardNumber.toLowerCase());
   });
-
-  const prices = filtered
-    .map(i => parseFloat(i.price.value))
-    .filter(p => p >= MIN_PRICE && p <= MAX_PRICE);
-
+  
+  // 2) if none, fallback: drop cardNumber requirement
+  if (filtered.length === 0) {
+    filtered = items;
+  }
+  
+  // final filtering: noise, exact name & set, condition, price range
+  const clean = filtered.filter(i => {
+    const t = i.title.toLowerCase();
+    if (NOISE_REGEX.test(t)) return false;
+    if (!t.includes(cardName.toLowerCase())) return false;
+    if (!t.includes(setName.toLowerCase())) return false;
+    if (condition.toLowerCase() === 'new' && !/near mint|mint/i.test(t)) return false;
+    if (condition.toLowerCase() === 'used' && /sealed|new/i.test(t)) return false;
+    const p = parseFloat(i.price.value);
+    return p >= MIN_PRICE && p <= MAX_PRICE;
+  });
+  
+  const prices = clean.map(i => parseFloat(i.price.value));
   const count = prices.length;
-  const avgPrice = count
-    ? prices.reduce((sum, p) => sum + p, 0) / count
-    : 0;
-
+  const avgPrice = count ? prices.reduce((s,p) => s + p, 0) / count : 0;
   return { avgPrice, count };
 }
 
-async function fetchOne({ cardName, setName, cardNumber, condition = '', sellerLocation = '', globalFallback = false }) {
-  const base = [cardName, setName, cardNumber].filter(Boolean).join(' ');
-  // Primary query: exact match + sold + location
-  const primaryQueryParts = [base, 'sold'];
-  if (sellerLocation) primaryQueryParts.push(`location:${sellerLocation}`);
-  if (condition)      primaryQueryParts.push(`condition:${condition}`);
-  const primaryQuery = primaryQueryParts.join(' ');
-  const cacheKey = primaryQuery.toLowerCase();
+async function fetchOne(opts) {
+  const { cardName, setName, cardNumber, condition = '', sellerLocation = '', globalFallback = false } = opts;
+  const cacheKey = [cardName, setName, cardNumber, condition, sellerLocation].join('|').toLowerCase();
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
 
-  if (cache.has(cacheKey)) {
-    return cache.get(cacheKey);
-  }
+  // 1) browse search with fallback built in
+  let result = await browseSearch(cardName, setName, cardNumber, condition, sellerLocation);
 
-  // 1) try strict browse search
-  let result = await browseSearch(primaryQuery, cardName, setName, cardNumber, condition);
-
-  // 2) fallback: drop only condition filter
-  if (result.count === 0 && condition) {
-    const fallbackQuery = [base, 'sold', `location:${sellerLocation}`].join(' ');
-    result = await browseSearch(fallbackQuery, cardName, setName, cardNumber, '');
-  }
-
-  // 3) optional global fallback: drop location
+  // 2) optional global fallback if still zero
   if (result.count === 0 && globalFallback) {
-    const globalQuery = [base, 'sold'].join(' ');
-    result = await browseSearch(globalQuery, cardName, setName, cardNumber, '');
+    result = await browseSearch(cardName, setName, cardNumber, condition, '');
   }
 
   cache.set(cacheKey, result);
@@ -100,12 +92,18 @@ app.post('/api/fetchBulkPrices', async (req, res) => {
     if (!Array.isArray(inputs)) {
       return res.status(400).json({ error: 'Expected an array of inputs' });
     }
-    const results = await Promise.all(inputs.map(fetchOne));
-    res.json(results);
+    const out = await Promise.all(inputs.map(fetchOne));
+    res.json(out);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Bulk fetch failed', details: e.toString() });
   }
+});
+
+app.listen(port, () => {
+  console.log(`CardCatch backend running on port ${port}`);
+});
+
 });
 
 app.listen(port, () => {

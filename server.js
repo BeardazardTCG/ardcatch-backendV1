@@ -1,6 +1,7 @@
-// server.js
 const express = require('express');
 const axios = require('axios');
+const NodeCache = require('node-cache');
+const cache = new NodeCache({ stdTTL: 3600 }); // 1h TTL
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -13,9 +14,14 @@ app.get('/', (req, res) => {
 app.get('/api/fetchCardPrice', async (req, res) => {
   try {
     const { cardName, setName, cardNumber } = req.query;
-    if (!cardName) {
-      return res.status(400).json({ error: 'cardName query parameter is required' });
-    }
+    if (!cardName) return res.status(400).json({ error: 'cardName query parameter is required' });
+
+    const searchQuery = [cardName, setName, cardNumber, 'sold']
+      .filter(Boolean)
+      .join(' ');
+    const cacheKey = searchQuery.toLowerCase();
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
 
     const tokenResponse = await axios.post(
       'https://api.ebay.com/identity/v1/oauth2/token',
@@ -29,39 +35,24 @@ app.get('/api/fetchCardPrice', async (req, res) => {
       }
     );
     const accessToken = tokenResponse.data.access_token;
-
-    const searchQuery = [cardName, setName, cardNumber, 'sold']
-      .filter(Boolean)
-      .join(' ');
     const params = new URLSearchParams({ q: searchQuery, limit: '5' });
-
     const itemsResponse = await axios.get(
       `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     const items = itemsResponse.data.itemSummaries || [];
+    const prices = items.map(i => parseFloat(i.price.value));
+    const avgPrice = prices.length ? prices.reduce((a,b)=>a+b,0)/prices.length : 0;
+    const payload = { avgPrice, items };
 
-    const prices = items.map(item => parseFloat(item.price.value));
-    const avgPrice = prices.length > 0
-      ? prices.reduce((sum, p) => sum + p, 0) / prices.length
-      : 0;
-
-    res.json({ avgPrice, items });
+    cache.set(cacheKey, payload);
+    res.json(payload);
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: 'Failed to fetch from eBay',
-      details: err.toString()
-    });
+    res.status(500).json({ error: 'Failed to fetch from eBay', details: err.toString() });
   }
 });
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-

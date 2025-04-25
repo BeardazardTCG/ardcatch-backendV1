@@ -13,14 +13,28 @@ async function getBrowseToken() {
     'https://api.ebay.com/identity/v1/oauth2/token',
     'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
     {
-      auth: {
-        username: process.env.EBAY_CLIENT_ID,
-        password: process.env.EBAY_CLIENT_SECRET
-      },
+      auth: { username: process.env.EBAY_CLIENT_ID, password: process.env.EBAY_CLIENT_SECRET },
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     }
   );
   return r.data.access_token;
+}
+
+function summarize(prices) {
+  const n = prices.length;
+  if (n === 0) return { count: 0, avgPrice: 0, median: 0, min: 0, max: 0, stdDev: 0 };
+  prices.sort((a,b)=>a-b);
+  const sum = prices.reduce((a,b)=>a+b, 0);
+  const avg = sum / n;
+  const mid = Math.floor(n/2);
+  const median = n % 2 === 1
+    ? prices[mid]
+    : (prices[mid-1] + prices[mid]) / 2;
+  const min = prices[0];
+  const max = prices[n-1];
+  const variance = prices.reduce((v, p) => v + Math.pow(p - avg, 2), 0) / n;
+  const stdDev = Math.sqrt(variance);
+  return { count: n, avgPrice: avg, median, min, max, stdDev };
 }
 
 async function browseSearch(query) {
@@ -30,17 +44,14 @@ async function browseSearch(query) {
     `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
-  const items = r.data.itemSummaries || [];
-  const prices = items.map(i => parseFloat(i.price.value));
-  const count = prices.length;
-  const avgPrice = count ? prices.reduce((a,b)=>a+b,0)/count : 0;
-  return { items, count, avgPrice };
+  const prices = (r.data.itemSummaries || []).map(i => parseFloat(i.price.value));
+  return summarize(prices);
 }
 
 async function findingSearch(keywords, daysAgo) {
   const now = new Date();
   const from = new Date(now - daysAgo*24*3600*1000).toISOString();
-  const to = now.toISOString();
+  const to   = now.toISOString();
   const xml = await axios.get(FINDING_BASE, {
     params: {
       'OPERATION-NAME':'findCompletedItems',
@@ -59,65 +70,48 @@ async function findingSearch(keywords, daysAgo) {
     }
   }).then(r=>r.data);
   const js = await parseStringPromise(xml);
-  const items = (js.findCompletedItemsResponse.searchResult[0].item||[]).map(i=>({
-    price: parseFloat(i.sellingStatus[0].currentPrice[0]._),
-    endTime: i.listingInfo[0].endTime[0]
-  }));
-  const prices = items.map(o=>o.price);
-  const count = prices.length;
-  const avgPrice = count ? prices.reduce((a,b)=>a+b,0)/count : 0;
-  return { items, count, avgPrice };
+  const prices = (js.findCompletedItemsResponse.searchResult[0].item || [])
+    .map(i => parseFloat(i.sellingStatus[0].currentPrice[0]._));
+  return summarize(prices);
 }
 
 async function fetchOne(opts) {
   const { cardName, setName, cardNumber, condition, sellerLocation, globalFallback, daysAgo } = opts;
   const base = [cardName, setName, cardNumber].filter(Boolean).join(' ');
-
-  // 1️⃣ daysAgo via Finding API, with fallback on error
+  // 1) daysAgo via Finding API
   if (daysAgo > 0) {
-    try {
-      return await findingSearch(base, daysAgo);
-    } catch (err) {
-      console.warn('Finding API error, falling back to Browse:', err.message);
-    }
+    try { return await findingSearch(base, daysAgo); }
+    catch(err) { console.warn('Finding error, fallback…'); }
   }
-
-  // 2️⃣ Browse logic (sold + location + condition)
+  // 2) Browse logic
   const primary = [base, 'sold', `location:${sellerLocation}`]
-    .concat(condition? [`condition:${condition}`]: [])
+    .concat(condition? [`condition:${condition}`]:[])
     .join(' ');
   const key = primary.toLowerCase();
   if (cache.has(key)) return cache.get(key);
-
   let result = await browseSearch(primary);
-
-  // 3️⃣ drop condition filter
   if (result.count===0 && condition) {
     const f2 = [base, 'sold', `location:${sellerLocation}`].join(' ');
     result = await browseSearch(f2);
   }
-
-  // 4️⃣ optional global fallback
   if (result.count===0 && globalFallback) {
-    result = await browseSearch([base, 'sold'].join(' '));
+    result = await browseSearch([base,'sold'].join(' '));
   }
-
   cache.set(key, result);
   return result;
 }
 
 app.use(express.json());
-app.post('/api/fetchBulkPrices', async (req,res) => {
+app.post('/api/fetchBulkPrices', async (req, res) => {
   try {
     const inputs = req.body;
     if (!Array.isArray(inputs)) return res.status(400).json({ error:'Expected an array' });
     const out = await Promise.all(inputs.map(fetchOne));
     res.json(out);
-  } catch(e) {
+  } catch (e) {
     console.error(e);
     res.status(500).json({ error:'Bulk fetch failed', details:e.toString() });
   }
 });
 
-app.listen(port,()=>console.log(`Server running on port ${port}`));
-
+app.listen(port,()=>console.log(`Server on port ${port}`));

@@ -17,7 +17,6 @@ app.post('/api/fetchCardPrices', async (req, res) => {
     const {
       cardName,
       setName,
-      rarityKeyword,
       mustInclude,
       mustNotInclude,
       graded,
@@ -25,16 +24,21 @@ app.post('/api/fetchCardPrices', async (req, res) => {
       grade
     } = req.body;
 
-    const keywords = [cardName, setName, rarityKeyword].filter(Boolean).join(' ');
-    const includeKeywords = mustInclude ? mustInclude.split(',').map(w => w.trim()) : [];
-    const excludeKeywords = mustNotInclude ? mustNotInclude.split(',').map(w => w.trim()) : [];
+    // Build basic keyword search (Card Name + Set Name only)
+    const keywords = [cardName, setName].filter(Boolean).join(' ');
 
+    // Prepare optional includes/excludes
+    const includeKeywords = mustInclude ? mustInclude.split(',').map(w => w.trim().toLowerCase()) : [];
+    const excludeKeywords = mustNotInclude ? mustNotInclude.split(',').map(w => w.trim().toLowerCase()) : [];
+
+    // Fetch sold listings
     const ebayResponse = await axios.post('https://api.scraperapi.com/', {
-      apiKey: 'YOUR_SCRAPERAPI_KEY',  // Insert your ScraperAPI key if needed
-      url: `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(keywords)}&_sop=13&LH_Sold=1&LH_Complete=1&LH_BIN=1&LH_ItemCondition=3000&LH_LocatedIn=GB&rt=nc&LH_PrefLoc=1&_ipg=200`
+      apiKey: 'YOUR_SCRAPERAPI_KEY', // Replace with your key
+      url: `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(keywords)}&_sop=13&LH_Sold=1&LH_Complete=1&LH_BIN=1&LH_LocatedIn=GB&_ipg=200`
     });
 
     const html = ebayResponse.data;
+
     const itemRegex = /"itemTitle":"(.*?)".*?"price":"([\d\.]+)"/g;
     let match;
     const items = [];
@@ -43,17 +47,23 @@ app.post('/api/fetchCardPrices', async (req, res) => {
       const title = match[1];
       const price = parseFloat(match[2]);
 
-      if (includeKeywords.length && !includeKeywords.some(word => title.toLowerCase().includes(word.toLowerCase()))) {
+      const titleLower = title.toLowerCase();
+
+      // If graded filter is true, check grading company and grade
+      if (graded && gradingCompany && !titleLower.includes(gradingCompany.toLowerCase())) {
         continue;
       }
-      if (excludeKeywords.length && excludeKeywords.some(word => title.toLowerCase().includes(word.toLowerCase()))) {
+      if (graded && grade && !title.includes(grade)) {
         continue;
       }
-      if (graded && gradingCompany) {
-        if (!title.toLowerCase().includes(gradingCompany.toLowerCase())) continue;
+
+      // Apply must include words
+      if (includeKeywords.length && !includeKeywords.some(word => titleLower.includes(word))) {
+        continue;
       }
-      if (graded && grade) {
-        if (!title.includes(grade)) continue;
+      // Apply must not include words
+      if (excludeKeywords.length && excludeKeywords.some(word => titleLower.includes(word))) {
+        continue;
       }
 
       items.push(price);
@@ -75,8 +85,8 @@ app.post('/api/fetchCardPrices', async (req, res) => {
     res.json({
       avgPrice: parseFloat(avgPrice.toFixed(2)),
       soldCount: items.length,
-      priceMin: priceMin,
-      priceMax: priceMax
+      priceMin: parseFloat(priceMin.toFixed(2)),
+      priceMax: parseFloat(priceMax.toFixed(2))
     });
 
   } catch (error) {

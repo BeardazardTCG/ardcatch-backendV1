@@ -8,15 +8,18 @@ const port = process.env.PORT || 3000;
 
 app.use(express.json());
 
-async function fetchOne({ cardName, setName, cardNumber, condition, sellerLocation }) {
-  const parts = [cardName, setName, cardNumber, 'sold'];
-  if (condition) parts.push(`condition:${condition}`);
-  if (sellerLocation) parts.push(`location:${sellerLocation}`);
-  const searchQuery = parts.filter(Boolean).join(' ');
-  const cacheKey = searchQuery.toLowerCase();
-  const cached = cache.get(cacheKey);
-  if (cached) return cached;
+async function doSearch(searchQuery) {
+  const params = new URLSearchParams({ q: searchQuery, limit: '5' });
+  const itemsRes = await axios.get(
+    `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
+    { headers: { Authorization: `Bearer ${await getToken()}` } }
+  );
+  const items = itemsRes.data.itemSummaries || [];
+  const prices = items.map(i => parseFloat(i.price.value));
+  return { items, count: prices.length, avgPrice: prices.length ? prices.reduce((a,b)=>a+b,0)/prices.length : 0 };
+}
 
+async function getToken() {
   const tokenRes = await axios.post(
     'https://api.ebay.com/identity/v1/oauth2/token',
     'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
@@ -28,21 +31,31 @@ async function fetchOne({ cardName, setName, cardNumber, condition, sellerLocati
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     }
   );
-  const token = tokenRes.data.access_token;
+  return tokenRes.data.access_token;
+}
 
-  const params = new URLSearchParams({ q: searchQuery, limit: '5' });
-  const itemsRes = await axios.get(
-    `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  const items = itemsRes.data.itemSummaries || [];
-  const prices = items.map(i => parseFloat(i.price.value));
-  const count = prices.length;
-  const avgPrice = count ? prices.reduce((a,b)=>a+b,0)/count : 0;
-  const payload = { avgPrice, count, items };
+async function fetchOne({ cardName, setName, cardNumber, condition, sellerLocation }) {
+  const baseParts = [cardName, setName, cardNumber, 'sold'].filter(Boolean);
+  const filters = [...baseParts];
+  if (condition) filters.push(`condition:${condition}`);
+  if (sellerLocation) filters.push(`location:${sellerLocation}`);
+  const primaryQuery = filters.join(' ');
+  const cacheKey = primaryQuery.toLowerCase();
 
-  cache.set(cacheKey, payload);
-  return payload;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  // 1) Primary search
+  let result = await doSearch(primaryQuery);
+
+  // 2) Fallback if no results
+  if (result.count === 0) {
+    const fallbackQuery = baseParts.join(' ');
+    result = await doSearch(fallbackQuery);
+  }
+
+  cache.set(cacheKey, result);
+  return result;
 }
 
 app.post('/api/fetchBulkPrices', async (req, res) => {

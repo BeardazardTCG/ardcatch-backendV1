@@ -6,9 +6,9 @@ const cache = new NodeCache({ stdTTL: 3600 });
 const app = express();
 const port = process.env.PORT || 3000;
 
-// noise terms to exclude
-const NOISE_REGEX = /\b(lot|binder|bulk|psa|proxy)\b/i;
-// acceptable price range
+// noise terms to exclude from titles
+const NOISE_REGEX = /\b(lot|binder|bulk|proxy)\b/i;
+// outlier price bounds
 const MIN_PRICE = 2;
 const MAX_PRICE = 500;
 
@@ -27,77 +27,71 @@ async function getToken() {
   return r.data.access_token;
 }
 
-async function browseSearch(cardName, setName, cardNumber, condition, sellerLocation) {
+async function browseSearch({ cardName, setName, condition, rarity, graded, language }) {
   const token = await getToken();
-  const queryParts = ['sold', `location:${sellerLocation}`, cardName, setName];
-  if (condition) queryParts.push(`condition:${condition}`);
-  const query = queryParts.join(' ');
+  const parts = ['sold', cardName, setName];
+  if (condition) parts.push(condition);
+  if (rarity)    parts.push(rarity);
+  if (language)  parts.push(language);
+  // we'll filter for graded IDs in code, not in query
+  const query = parts.join(' ');
   const params = new URLSearchParams({ q: query, limit: '10' });
-  const r = await axios.get(
+  const resp = await axios.get(
     `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
-  const items = r.data.itemSummaries || [];
+  const items = resp.data.itemSummaries || [];
 
-  // ensure cardNumber is a string
-  const cn = String(cardNumber).toLowerCase();
-
-  // 1) strict filter: must contain cardNumber
+  // 1) text‐filter
   let filtered = items.filter(i => {
     const t = i.title.toLowerCase();
-    return t.includes(cn);
+    if (NOISE_REGEX.test(t))            return false;
+    if (condition && !t.includes(condition.toLowerCase())) return false;
+    if (rarity    && !t.includes(rarity.toLowerCase()))    return false;
+    if (language  && !t.includes(language.toLowerCase()))  return false;
+    if (graded) {
+      // only PSA/CGC listings
+      if (!/(psa|cgc)/i.test(t)) return false;
+    } else {
+      // exclude any PSA/CGC
+      if (/(psa|cgc)/i.test(t))  return false;
+    }
+    return true;
   });
 
-  // 2) if none, fallback: drop cardNumber requirement
-  if (filtered.length === 0) {
-    filtered = items;
-  }
+  // 2) numeric filter
+  const prices = filtered
+    .map(i => parseFloat(i.price.value))
+    .filter(p => p >= MIN_PRICE && p <= MAX_PRICE);
 
-  // final filtering: noise, exact name & set, condition, price range
-  const clean = filtered.filter(i => {
-    const t = i.title.toLowerCase();
-    if (NOISE_REGEX.test(t)) return false;
-    if (!t.includes(cardName.toLowerCase())) return false;
-    if (!t.includes(setName.toLowerCase())) return false;
-    if (condition.toLowerCase() === 'new' && !/near mint|mint/i.test(t)) return false;
-    if (condition.toLowerCase() === 'used' && /sealed|new/i.test(t)) return false;
-    const p = parseFloat(i.price.value);
-    return p >= MIN_PRICE && p <= MAX_PRICE;
-  });
-
-  const prices = clean.map(i => parseFloat(i.price.value));
   const count = prices.length;
-  const avgPrice = count ? prices.reduce((s, p) => s + p, 0) / count : 0;
+  const avgPrice = count
+    ? prices.reduce((sum, v) => sum + v, 0) / count
+    : 0;
+
   return { avgPrice, count };
 }
 
 async function fetchOne(opts) {
-  const { cardName, setName, cardNumber, condition = '', sellerLocation = '', globalFallback = false } = opts;
-  const cacheKey = [cardName, setName, cardNumber, condition, sellerLocation].join('|').toLowerCase();
-  if (cache.has(cacheKey)) return cache.get(cacheKey);
+  const key = JSON.stringify(opts).toLowerCase();
+  if (cache.has(key)) return cache.get(key);
 
-  // 1) browse search with built-in strict→loose fallback
-  let result = await browseSearch(cardName, setName, cardNumber, condition, sellerLocation);
-
-  // 2) optional global fallback if still zero
-  if (result.count === 0 && globalFallback) {
-    result = await browseSearch(cardName, setName, cardNumber, condition, '');
-  }
-
-  cache.set(cacheKey, result);
+  const result = await browseSearch(opts);
+  cache.set(key, result);
   return result;
 }
 
 app.use(express.json());
-
 app.post('/api/fetchBulkPrices', async (req, res) => {
   try {
-    const inputs = req.body;
-    if (!Array.isArray(inputs)) {
+    const rows = req.body;
+    if (!Array.isArray(rows)) {
       return res.status(400).json({ error: 'Expected an array of inputs' });
     }
-    const results = await Promise.all(inputs.map(fetchOne));
-    res.json(results);
+    const out = await Promise.all(
+      rows.map(r => fetchOne(r))
+    );
+    res.json(out);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Bulk fetch failed', details: e.toString() });
